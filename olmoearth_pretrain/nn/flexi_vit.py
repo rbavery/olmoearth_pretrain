@@ -49,6 +49,26 @@ def return_modalities_from_dict(
     ]
 
 
+def _expand_encoding_for_axes(
+    encoding: Tensor,
+    source_axes: tuple[str, ...],
+    target_axes: tuple[str, ...],
+    axis_sizes: dict[str, int | torch.SymInt],
+) -> Tensor:
+    """Expand an encoding tensor to match a target token layout."""
+    expanded = encoding
+    insert_dim = 0
+    for axis in target_axes:
+        if axis not in source_axes:
+            expanded = expanded.unsqueeze(insert_dim)
+        insert_dim += 1
+
+    expand_shape = [
+        -1 if axis in source_axes else axis_sizes[axis] for axis in target_axes
+    ]
+    return expanded.expand(*expand_shape, -1)
+
+
 class PoolingType(StrEnum):
     """Strategy for pooling the tokens."""
 
@@ -838,70 +858,96 @@ class CompositeEncodings(nn.Module):
 
         modality = Modality.get(modality_name)
         logger.debug(f"Applying encodings to modality {modality}")
+        b = modality_tokens.shape[0]
+        h = None
+        w = None
+        t = None
         if not use_modality_encodings and use_temporal_encodings:
             b, h, w, t, _ = modality_tokens.shape
-            ein_string, ein_dict = (
-                "b h w t d",
-                {"b": b, "h": h, "w": w, "t": t},
-            )
+            target_axes = ("b", "h", "w", "t")
+            axis_sizes = {"b": b, "h": h, "w": w, "t": t}
         elif not use_temporal_encodings and not use_modality_encodings:
             b, h, w, _ = modality_tokens.shape
-            ein_string, ein_dict = (
-                "b h w d",
-                {"b": b, "h": h, "w": w},
-            )
+            target_axes = ("b", "h", "w")
+            axis_sizes = {"b": b, "h": h, "w": w}
         elif not use_temporal_encodings and use_modality_encodings:
             raise NotImplementedError("Not implemented")
         else:
             if modality_tokens.ndim == 3:
                 # modality_tokens = [B, Band_Sets, D]; static in space, static in time
                 b, b_s, _ = modality_tokens.shape
-                ein_string, ein_dict = "b b_s d", {"b": b, "b_s": b_s}
+                target_axes = ("b", "b_s")
+                axis_sizes = {"b": b, "b_s": b_s}
             elif modality_tokens.ndim == 4:
                 b, t, b_s, _ = modality_tokens.shape
-                ein_string, ein_dict = "b t b_s d", {"b": b, "t": t, "b_s": b_s}
+                target_axes = ("b", "t", "b_s")
+                axis_sizes = {"b": b, "t": t, "b_s": b_s}
             elif modality_tokens.ndim == 5:
                 b, h, w, b_s, _ = modality_tokens.shape
-                ein_string, ein_dict = (
-                    "b h w b_s d",
-                    {"b": b, "h": h, "w": w, "b_s": b_s},
-                )
+                target_axes = ("b", "h", "w", "b_s")
+                axis_sizes = {"b": b, "h": h, "w": w, "b_s": b_s}
             elif modality_tokens.ndim == 6:
                 b, h, w, t, b_s, _ = modality_tokens.shape
-                ein_string, ein_dict = (
-                    "b h w t b_s d",
-                    {"b": b, "h": h, "w": w, "t": t, "b_s": b_s},
-                )
+                target_axes = ("b", "h", "w", "t", "b_s")
+                axis_sizes = {"b": b, "h": h, "w": w, "t": t, "b_s": b_s}
             else:
                 raise ValueError(f"Unsupported tokens shape: {modality_tokens.shape}")
 
         device = modality_tokens.device
-        modality_embed = torch.zeros(modality_tokens.shape, device=device)
         n = self.embedding_dim_per_embedding_type
+        embed_shape = (*modality_tokens.shape[:-1], n)
+        zero_embed = torch.zeros(
+            embed_shape, device=device, dtype=modality_tokens.dtype
+        )
+        embed_slices = []
 
         # Channel embeddings
         if use_modality_encodings:
             channel_embed = self.per_modality_channel_embeddings[modality.name]
-            channel_embed = repeat(
-                channel_embed, f"b_s d -> {ein_string}", **ein_dict
-            ).to(device)
-            modality_embed[..., :n] += channel_embed
+            embed_slices.append(
+                _expand_encoding_for_axes(
+                    channel_embed.to(device),
+                    source_axes=("b_s",),
+                    target_axes=target_axes,
+                    axis_sizes=axis_sizes,
+                )
+            )
+        else:
+            embed_slices.append(zero_embed)
 
         if modality.is_multitemporal and use_temporal_encodings:
             # Time position encodings
-            time_embed = repeat(self.pos_embed[:t], f"t d -> {ein_string}", **ein_dict)
-            modality_embed[..., n : n * 2] += time_embed.to(device)
+            assert t is not None
+            time_embed = torch.narrow(self.pos_embed, 0, 0, t)
+            embed_slices.append(
+                _expand_encoding_for_axes(
+                    time_embed.to(device),
+                    source_axes=("t",),
+                    target_axes=target_axes,
+                    axis_sizes=axis_sizes,
+                )
+            )
 
             # Month encodings
             assert timestamps is not None
             months = timestamps[:, :, 1]
             month_embed = self.month_embed(months)
-            month_embed = repeat(month_embed, f"b t d -> {ein_string}", **ein_dict)
-            modality_embed[..., n * 2 : n * 3] += month_embed.to(device)
+            embed_slices.append(
+                _expand_encoding_for_axes(
+                    month_embed.to(device),
+                    source_axes=("b", "t"),
+                    target_axes=target_axes,
+                    axis_sizes=axis_sizes,
+                )
+            )
+        else:
+            embed_slices.extend([zero_embed, zero_embed])
         if modality.is_spatial:
             # Spatial encodings
             assert input_res is not None
             assert patch_size is not None
+            assert h is not None
+            assert w is not None
             gsd_ratio = self.calculate_gsd_ratio(input_res, patch_size)
             spatial_embed = get_2d_sincos_pos_encoding_with_resolution(
                 grid_size=h,
@@ -910,10 +956,31 @@ class CompositeEncodings(nn.Module):
                 device=device,
             )
             spatial_embed = rearrange(spatial_embed, "b (h w) d -> b h w d", h=h, w=w)
-            spatial_embed = repeat(
-                spatial_embed, f"b h w d -> {ein_string}", **ein_dict
+            embed_slices.append(
+                _expand_encoding_for_axes(
+                    spatial_embed,
+                    source_axes=("b", "h", "w"),
+                    target_axes=target_axes,
+                    axis_sizes=axis_sizes,
+                )
             )
-            modality_embed[..., n * 3 : n * 4] += spatial_embed
+        else:
+            embed_slices.append(zero_embed)
+
+        modality_embed = torch.cat(embed_slices, dim=-1)
+        remainder = modality_tokens.shape[-1] - modality_embed.shape[-1]
+        if remainder > 0:
+            modality_embed = torch.cat(
+                [
+                    modality_embed,
+                    torch.zeros(
+                        (*modality_tokens.shape[:-1], remainder),
+                        device=device,
+                        dtype=modality_tokens.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
         return modality_tokens + modality_embed
 
     def forward(
